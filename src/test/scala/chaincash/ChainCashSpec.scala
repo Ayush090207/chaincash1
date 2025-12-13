@@ -327,6 +327,191 @@ class ChainCashSpec extends PropSpec with Matchers with ScalaCheckDrivenProperty
     }
   }
 
+  property("redemption with custom token reserve") {
+    createMockedErgoClient(MockData(Nil, Nil)).execute { implicit ctx: BlockchainContext =>
+      val position = 0L
+
+      val reserveTokenId = "551A3A5250655368566D597133743677397A24432646294A404D635166546A57"
+      val reserveTokenIdBytes = Base16.decode(reserveTokenId).get
+      val reserveTokenAmount = 1000000L
+
+      val positionBytes = Longs.toByteArray(position)
+      val msg: Array[Byte] = positionBytes ++ Longs.toByteArray(noteValue) ++ Base16.decode(noteTokenId).get
+      val sig = SigUtils.sign(msg, holderSecret)
+
+      val plasmaMap = new PlasmaMap[Array[Byte], Array[Byte]](AvlTreeFlags.InsertOnly, chainCashPlasmaParameters)
+      val sigBytes = GroupElementSerializer.toBytes(sig._1) ++ sig._2.toByteArray
+      val keyBytes = positionBytes ++ reserveNFTBytes
+      val insertRes = plasmaMap.insert(keyBytes -> sigBytes)
+      val _ = insertRes.proof
+      val historyTree = plasmaMap.ergoValue.getValue
+
+      val lookupRes = plasmaMap.lookUp(keyBytes)
+      val lookupProof = lookupRes.proof
+
+      val noteInput =
+        ctx
+          .newTxBuilder()
+          .outBoxBuilder
+          .value(minValue + feeValue)
+          .tokens(new ErgoToken(noteTokenId, noteValue))
+          .registers(ErgoValue.of(historyTree), ErgoValue.of(holderPk))
+          .contract(ctx.compileContract(ConstantsBuilder.empty(), Constants.noteContract))
+          .build()
+          .convertToInputWith(fakeTxId1, fakeIndex)
+          .withContextVars(
+            new ContextVar(0, ErgoValue.of(-1: Byte)) // Action: Redeem
+          )
+
+      // Reserve box with custom tokens
+      val reserveInput =
+        ctx
+          .newTxBuilder()
+          .outBoxBuilder
+          .value(minValue)
+          .tokens(
+            new ErgoToken(reserveNFTBytes, 1),
+            new ErgoToken(reserveTokenIdBytes, reserveTokenAmount)
+          )
+          .registers(ErgoValue.of(holderPk), Constants.emptyTreeErgoValue)
+          .contract(ctx.compileContract(ConstantsBuilder.empty(), Constants.reserveTokenContract))
+          .build()
+          .convertToInputWith(fakeTxId2, fakeIndex)
+          .withContextVars(
+            new ContextVar(0, ErgoValue.of(0: Byte)), // Action: Redeem
+            new ContextVar(1, ErgoValue.of(lookupProof.bytes)),
+            new ContextVar(2, ErgoValue.of(Longs.toByteArray(noteValue))),
+            new ContextVar(3, ErgoValue.of(position)),
+            new ContextVar(4, ErgoValue.of(false))
+          )
+
+      val buyBackInput =
+        ctx
+          .newTxBuilder()
+          .outBoxBuilder
+          .value(minValue)
+          .tokens(new ErgoToken(buyBackNftId, 1))
+          .contract(trueErgoContract)
+          .build()
+          .convertToInputWith(fakeTxId5, fakeIndex)
+
+      val oracleRate = 500000L // nanoErg per mg (1 mg Gold = 0.0005 ERG)
+      val oracleDataInput =
+        ctx
+          .newTxBuilder()
+          .outBoxBuilder
+          .value(minValue)
+          .tokens(new ErgoToken(oracleNFTBytes, 1))
+          .registers(ErgoValue.of(oracleRate * 1000000))
+          .contract(ctx.compileContract(ConstantsBuilder.empty(), "{false}"))
+          .build()
+          .convertToInputWith(fakeTxId3, fakeIndex)
+
+      // Spectrum Pool Mock
+      // 1 ERG = 100 Reserve Tokens
+      // Pool contains 1000 ERG and 100,000 Reserve Tokens
+      val poolErgBalance = 1000L * 1000000000L
+      val poolTokenBalance = 100000L
+      val poolDataInput =
+          ctx
+            .newTxBuilder()
+            .outBoxBuilder
+            .value(poolErgBalance)
+            .tokens(
+                new ErgoToken("0000000000000000000000000000000000000000000000000000000000000000", 1), // Pool NFT
+                new ErgoToken("1000000000000000000000000000000000000000000000000000000000000000", 1000000000L), // LP Token
+                new ErgoToken(reserveTokenId, poolTokenBalance) // Asset Token
+            )
+            .contract(ctx.compileContract(ConstantsBuilder.empty(), "{false}"))
+            .build()
+            .convertToInputWith(fakeTxId4, fakeIndex)
+
+      // Required Redemption Amount
+      // NoteValue (1 mg) = 0.0005 ERG
+      // 0.0005 ERG = 0.0005 * 100 = 0.05 Tokens?
+      // Formula: NoteValue * OracleRate * PoolToken / PoolErg
+      // = 1 * 500,000 * 100,000 / 1,000,000,000,000
+      // = 5e5 * 1e5 / 1e12 = 5e10 / 1e12 = 0.05
+      // Wait, OracleRate is nanoErg per MG.
+      // 500,000 nanoErg = 0.0005 ERG.
+      // Pool: 1000 ERG = 100,000 Tokens => 1 ERG = 100 Tokens.
+      // 0.0005 ERG = 0.05 Tokens.
+      // Integer math: 500,000 * 100,000 / 1,000,000,000,000 = 50,000,000,000 / 1,000,000,000,000 = 0.
+      // Zero? That's strictly due to integer division if I used those exact numbers.
+      // Let's adjust pool to make it more significant or note value higher.
+      // Let's say NoteValue = 1000 (1g).
+      // 1000 * 500,000 = 500,000,000 (0.5 ERG).
+      // 0.5 ERG * 100 Tokens/ERG = 50 Tokens.
+
+      // Let's adjust pool balance instead to be realistic for low decimal tokens?
+      // Or just make numbers bigger.
+      // Pool: 10 ERG (10e9), 1,000,000 Tokens. 1 ERG = 100,000 Tokens.
+      // 0.0005 ERG * 100,000 = 50 Tokens.
+      // Math: 1 * 500,000 * 1,000,000 / 10,000,000,000
+      // = 500,000,000,000 / 10,000,000,000 = 50.
+      // Perfect.
+
+      val poolErgBalance2 = 10L * 1000000000L
+      val poolTokenBalance2 = 1000000L
+
+      val poolDataInput2 =
+          ctx
+            .newTxBuilder()
+            .outBoxBuilder
+            .value(poolErgBalance2)
+            .tokens(
+                new ErgoToken("0000000000000000000000000000000000000000000000000000000000000000", 1), // Pool NFT
+                new ErgoToken("1000000000000000000000000000000000000000000000000000000000000000", 1000000000L), // LP Token
+                new ErgoToken(reserveTokenId, poolTokenBalance2) // Asset Token
+            )
+            .contract(ctx.compileContract(ConstantsBuilder.empty(), "{false}"))
+            .build()
+            .convertToInputWith(fakeTxId4, fakeIndex)
+
+      val calculatedRedemption = 50L
+      // 2% fee taken by reserve
+      val redeemedAmount = calculatedRedemption * 98 / 100
+
+      val reserveOutput = createOut(
+        Constants.reserveTokenContract,
+        minValue, // ERG value preserved
+        registers = Array(ErgoValue.of(holderPk), Constants.emptyTreeErgoValue),
+        tokens = Array(
+            new ErgoToken(reserveNFT, 1),
+            new ErgoToken(reserveTokenId, reserveTokenAmount - redeemedAmount)
+        )
+      )
+
+      val receiptOutput = createOut(
+        Constants.receiptContract,
+        minValue,
+        registers = Array(ErgoValue.of(historyTree), ErgoValue.of(0L), ErgoValue.of(ctx.getHeight - 5), ErgoValue.of(holderPk)),
+        tokens = Array(new ErgoToken(noteTokenId, noteValue))
+      )
+
+      val buyBackOutput = createOut(
+        trueScript,
+        buyBackInput.getValue, // No ERG change for buyback in this version
+        registers = Array(),
+        tokens = Array(new ErgoToken(buyBackNftId, 1))
+      )
+
+      val inputs = Array[InputBox](noteInput, reserveInput, buyBackInput)
+      val dataInputs = Array[InputBox](oracleDataInput, poolDataInput2)
+      val outputs = Array[OutBoxImpl](reserveOutput, receiptOutput, buyBackOutput)
+
+      createTx(
+        inputs,
+        dataInputs,
+        outputs,
+        fee = None ,
+        changeAddress,
+        Array[String](holderSecret.toString()),
+        false
+      )
+    }
+  }
+
   property("chain of redemptions") {
     val reserveASecret = SigUtils.randBigInt
     val reserveAPk = Constants.g.exp(reserveASecret.bigInteger)

@@ -59,6 +59,11 @@ object Constants {
   val receiptContractHash = Blake2b256(receiptErgoTree.bytes.tail)
   val receiptContractHashString = Base58.encode(receiptContractHash)
 
+  // Token Reserve Contract
+  val reserveTokenContract = readContract("onchain/reserve_token.es", Map.empty)
+  val reserveTokenErgoTree = compile(reserveTokenContract)
+  val reserveTokenAddress = getAddressFromErgoTree(reserveTokenErgoTree)
+
   val noteContract = readContract("onchain/note.es",
     Map("reserveContractHash" -> reserveContractHashString, "receiptContractHash" -> receiptContractHashString))
   val noteErgoTree = compile(noteContract)
